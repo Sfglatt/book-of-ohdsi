@@ -1,0 +1,463 @@
+---
+title: "02_exercises"
+author: "Sglatt"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Exercises Book of OHDSI (Observational Health Data Sciences and Informatics) (link: https://ohdsi.github.io/TheBookOfOhdsi/)
+
+Most HADES packages need to interact with a database. HADES `databaseConnector` makes these connections
+
+`SqlRender` +  `DatabaseConnector` provide a way to query data in the CDM
+
+The `Eunomia` package provides a simulated dataset in the CDM that will run inside the local R session
+
+Importing a synthetic dataset from Eunomia via these packages and doing some exercises
+
+Note: the exercises have a different API then the latest version I installed, so there's troubleshooting sprinkled in here
+
+# Data and packages
+```{r Packages }
+# Data and packages
+options(repos = c(
+  CRAN = "https://cran.rstudio.com"
+))
+
+if (!require("Eunomia")) {
+  install.packages("Eunomia")
+  library(Eunomia)
+}
+
+install.packages(
+  c("dbplyr", "DatabaseConnector"),
+  type = "binary"
+)
+library(DatabaseConnector)
+
+if (!require("SqlRender")) {
+  install.packages("SqlRender")
+  library(SqlRender)
+}
+
+# Get the connection details
+connectionDetails <- Eunomia::getEunomiaConnectionDetails()
+connectionDetails
+
+# Connect using the SQLite driver
+connection <- connect(connectionDetails)
+
+# Create the cohorts used in Chapter 10
+Eunomia::createCohorts(connectionDetails)
+
+# Chapter 10
+library(CohortMethod)
+
+# Chapter 11
+install.packages(
+  "FeatureExtraction",
+  repos = c(
+    "https://ohdsi.github.io/drat",
+    "https://cran.rstudio.com"
+  )
+)
+library(FeatureExtraction)
+
+# Chapter 13
+install.packages(
+  "PatientLevelPrediction",
+  repos = c(
+    "https://ohdsi.github.io/drat",
+    "https://cran.rstudio.com"
+  )
+)
+library(PatientLevelPrediction)
+```
+
+# Folder for any output
+```{r folder}
+if (!dir.exists("02_output")) {
+  dir.create("02_output")
+}
+```
+
+# Exercises with the synthetic data 
+
+## Chapter 9, SQL and R 
+```{r ch 9 exercises}
+# These exercises use SQL to answer simple questions about the OMOP CDM
+
+# 1. How many people are in the database
+sql <- "SELECT COUNT(*) AS person_count
+FROM @cdm.person;"
+
+renderTranslateQuerySql(connection, sql, cdm = "main") # 2694
+
+# 2. How many people have at least one prescription of celecoxib?
+sql <- "SELECT COUNT(DISTINCT(person_id)) AS person_count
+FROM @cdm.drug_exposure
+INNER JOIN @cdm.concept_ancestor
+  ON drug_concept_id = descendant_concept_id
+INNER JOIN @cdm.concept ingredient
+  ON ancestor_concept_id = ingredient.concept_id
+WHERE LOWER(ingredient.concept_name) = 'celecoxib'
+  AND ingredient.concept_class_id = 'Ingredient'
+  AND ingredient.standard_concept = 'S';"
+
+renderTranslateQuerySql(connection, sql, cdm = "main") # 1844
+
+# 3. How many diagnoses of gastrointestinal hemorrhage occur during exposure to celecoxib?
+sql <- "SELECT COUNT(*) AS diagnose_count
+FROM @cdm.drug_era
+INNER JOIN @cdm.concept ingredient
+  ON drug_concept_id = ingredient.concept_id
+INNER JOIN @cdm.condition_occurrence
+  ON condition_start_date >= drug_era_start_date
+    AND condition_start_date <= drug_era_end_date
+INNER JOIN @cdm.concept_ancestor
+  ON condition_concept_id =descendant_concept_id
+WHERE LOWER(ingredient.concept_name) = 'celecoxib'
+  AND ingredient.concept_class_id = 'Ingredient'
+  AND ingredient.standard_concept = 'S'
+  AND ancestor_concept_id = 192671;"
+
+renderTranslateQuerySql(connection, sql, cdm = "main") # 41
+```
+
+## Chapter 10, Defining a Cohort
+```{r ch 10 exercises}
+# Create a cohort for acute myocardial infarction (AMI) in the existing COHORT table, following these criteria:
+
+# 1) An occurrence of a myocardial infarction diagnose (concept 4329847 “Myocardial infarction” and all of its descendants, excluding concept 314666 “Old myocardial infarction” and any of its descendants).
+
+# 2) During an inpatient or ER visit (concepts 9201, 9203, and 262 for “Inpatient visit”, “Emergency Room Visit”, and “Emergency Room and Inpatient Visit”, respectively).
+
+
+# For 1, find all AMI condition occurrences and store these in a temp table called “#diagnoses”
+sql <- "SELECT person_id AS subject_id,
+  condition_start_date AS cohort_start_date
+INTO #diagnoses
+FROM @cdm.condition_occurrence
+WHERE condition_concept_id IN (
+    SELECT descendant_concept_id
+    FROM @cdm.concept_ancestor
+    WHERE ancestor_concept_id = 4329847 -- Myocardial infarction
+)
+  AND condition_concept_id NOT IN (
+    SELECT descendant_concept_id
+    FROM @cdm.concept_ancestor
+    WHERE ancestor_concept_id = 314666 -- Old myocardial infarction
+);"
+
+renderTranslateExecuteSql(connection, sql, cdm = "main")
+
+# Then for 2, select  those that occur during an inpatient or ER visit, using some unique COHORT_DEFINITION_ID (here selected ‘1’)
+sql <- "INSERT INTO @cdm.cohort (
+  subject_id,
+  cohort_start_date,
+  cohort_definition_id
+  )
+SELECT subject_id,
+  cohort_start_date,
+  CAST (1 AS INT) AS cohort_definition_id
+FROM #diagnoses
+INNER JOIN @cdm.visit_occurrence
+  ON subject_id = person_id
+    AND cohort_start_date >= visit_start_date
+    AND cohort_start_date <= visit_end_date
+WHERE visit_concept_id IN (9201, 9203, 262); -- Inpatient or ER;"
+
+renderTranslateExecuteSql(connection, sql, cdm = "main")
+```
+
+## Chapter 12, Population-Level Estimation
+```{r ch. 12 exercises}
+# Estimate the risk of gastrointestinal (GI) bleeding in new users of
+# celecoxib compared with new users of diclofenac.
+
+
+# celecoxib new-user cohort COHORT_DEFINITION_ID = 1
+# diclofenac new-user cohort COHORT_DEFINITION_ID = 2
+# GI bleed cohort COHORT_DEFINITION_ID = 3
+# concept ID for celecoxib is 1118084
+# diclofenac  ID for celecoxib 1124300,
+
+# 1. Define covariates and extract CohortMethodData
+
+nsaids <- c(1118084, 1124300) # celecoxib, diclofenac
+
+covSettings <- createDefaultCovariateSettings(
+  excludedCovariateConceptIds = nsaids,
+  addDescendantsToExclude = TRUE)
+
+# 2. Extract CohortMethodData from the CDM
+
+# Troubleshooting...
+# Different versions of CohortMethod use different function interfaces.
+args(getDbCohortMethodData)
+args(createGetDbCohortMethodDataArgs)
+
+# Fix it
+# In this version, covariateSettings has to be via createGetDbCohortMethodDataArgs()
+getDbCohortMethodDataArgs <- createGetDbCohortMethodDataArgs(
+  covariateSettings = covSettings
+)
+
+# Back to extracting the data
+cmData <- getDbCohortMethodData(
+  connectionDetails = connectionDetails,
+  cdmDatabaseSchema = "main",
+  targetId = 1,
+  comparatorId = 2,
+  outcomeIds = 3,
+  exposureDatabaseSchema = "main",
+  exposureTable = "cohort",
+  outcomeDatabaseSchema = "main",
+  outcomeTable = "cohort",
+  getDbCohortMethodDataArgs = getDbCohortMethodDataArgs
+)
+
+# Look at the data
+summary(cmData)
+
+# 3. Define the study population
+# exclude subjects with a prior GI bleed
+# start the risk window at cohort start
+# follow subjects through the end of their cohort observation period
+
+# Troubleshooting
+args(createStudyPopulation)
+args(createCreateStudyPopulationArgs)
+
+# Study population
+studyPop <- CohortMethod::createStudyPopulation(
+  cohortMethodData = cmData,
+  outcomeId = 3,
+  createStudyPopulationArgs = CohortMethod::createCreateStudyPopulationArgs(
+    removeSubjectsWithPriorOutcome = TRUE,
+    riskWindowStart = 0,
+    startAnchor = "cohort start",
+    riskWindowEnd = 99999,
+    endAnchor = "cohort end"
+  )
+)
+
+# 4. Examine study-population attrition
+
+# Draw the attrition/flowchart
+drawAttritionDiagram(studyPop)
+
+# 5. Fit an unadjusted Cox proportional hazards model
+
+# Troubleshoot
+args(fitOutcomeModel)
+args(createFitOutcomeModelArgs)
+
+cox_model <- fitOutcomeModel(
+  population = studyPop,
+  fitOutcomeModelArgs = createFitOutcomeModelArgs(
+    modelType = "cox"
+  )
+)
+
+# Look at the results
+cox_model
+
+# 6. Estimate the propensity score with covariates from above
+
+ps <- createPs(cohortMethodData = cmData,
+               population = studyPop)
+
+# Plot the preference score distribution
+plotPs(ps, showCountsLabel = TRUE, showAucLabel = TRUE)
+
+# 7. Stratify on the propensity score and assess covariate balance
+
+strataPop <- stratifyByPs(ps) # Divide subjects into propensity-score strata
+
+# Now look at covariate balance before and after propensity-score stratification
+
+bal <- computeCovariateBalance(strataPop, cmData)
+
+# Plot the standardized covariate balance
+plotCovariateBalanceScatterPlot(bal,
+                                showCovariateCountLabel = TRUE,
+                                showMaxLabel = TRUE,
+                                beforeLabel = "Before stratification",
+                                afterLabel = "After stratification")
+
+# 8. Fit a Cox proportional hazards model using the propensity score strata
+adjModel <- fitOutcomeModel(
+  population = strataPop,
+  fitOutcomeModelArgs = createFitOutcomeModelArgs(
+    modelType = "cox",
+    stratified = TRUE
+  )
+)
+
+# Look at the results
+adjModel
+```
+
+## Chapter 13, Patient-Level Prediction
+```{r ch. 13 exercises}
+
+# Predict which patients who are new users of NSAIDs will develop a
+# gastrointestinal (GI) bleed during the following year.
+
+# Study cohorts:
+#   Target/exposure cohort: new NSAID users (COHORT_DEFINITION_ID = 4)
+#   Outcome cohort: GI bleed (COHORT_DEFINITION_ID = 3)
+
+# 1. Define the covariates and extract the PLP data
+
+# Define the baseline characteristics that will be used as predictors
+
+covSettings <- createCovariateSettings(
+  useDemographicsGender = TRUE,
+  useDemographicsAge = TRUE,
+  useConditionGroupEraLongTerm = TRUE,
+  useConditionGroupEraAnyTimePrior = TRUE,
+  useDrugGroupEraLongTerm = TRUE,
+  useDrugGroupEraAnyTimePrior = TRUE,
+  useVisitConceptCountLongTerm = TRUE,
+  longTermStartDays = -365,
+  endDays = -1
+)
+
+# Troubleshooting; inspect the API for the installed PLP version
+
+args(getPlpData)
+args(createRestrictPlpDataSettings)
+args(createDatabaseDetails)
+
+
+# Create the database configuration used by getPlpData().
+
+# cohortId = 4 identifies the NSAID new-user target cohort.
+# outcomeIds = 3 identifies the GI bleed outcome cohort.
+
+# The CDM, target cohort, and outcome cohort are all stored in the "main.cohort" table in this study
+
+databaseDetails <- createDatabaseDetails(
+  connectionDetails = connectionDetails,
+  cdmDatabaseSchema = "main",
+  cdmDatabaseName = "main",
+  cdmDatabaseId = 1,       # Replace with the actual CDM database ID if needed
+  cohortDatabaseSchema = "main",
+  cohortTable = "cohort",
+  outcomeDatabaseSchema = "main",
+  outcomeTable = "cohort",
+  cohortId = 4,
+  outcomeIds = 3
+)
+
+
+# Extract the PLP data from the CDM using the database configuration
+# and the covariate definitions above.
+
+plpData <- getPlpData(
+  databaseDetails = databaseDetails,
+  covariateSettings = covSettings
+)
+
+
+# Look at summary of the data
+
+summary(plpData)
+
+
+# 2. Define the prediction-study population
+# The study population is defined around the NSAID cohort entry.
+
+# Troubleshooting; look at the API used by the installed PLP version.
+
+args(createStudyPopulation)
+args(createStudyPopulationSettings)
+formals(createStudyPopulation)
+
+
+# createStudyPopulation() returns the actual study population
+# createStudyPopulationSettings() defines the rules used to construct it.
+
+plpStudyPop <- createStudyPopulation(
+  plpData,
+  3,
+  createStudyPopulationSettings(
+    washoutPeriod = 364,
+    firstExposureOnly = FALSE,
+    removeSubjectsWithPriorOutcome = TRUE,
+    priorOutcomeLookback = 9999,
+    riskWindowStart = 1,
+    startAnchor = "cohort start",
+    riskWindowEnd = 365,
+    endAnchor = "cohort start",
+    minTimeAtRisk = 364,
+    requireTimeAtRisk = TRUE,
+    includeAllOutcomes = TRUE
+  )
+)
+
+
+# Check how many patients remain in the final prediction population.
+
+nrow(plpStudyPop)
+
+
+# 3. Specify the prediction model
+# Use LASSO logistic regression.
+
+lassoModel <- setLassoLogisticRegression(seed = 0)
+
+# 4. Define the train/test split
+
+# Troubleshooting; inspect the arguments accepted by runPlp() in the
+# installed version of PatientLevelPrediction.
+
+args(runPlp)
+
+# Use a subject-level split 75/25 split
+splitSettings <- createDefaultSplitSetting(
+  type = "subject",
+  testFraction = 0.25,
+  trainFraction = 0.75,
+  splitSeed = 123456,
+  nfold = 2
+)
+
+
+# 5. Specify the population settings for runPlp()
+
+# runPlp() expects the population settings
+# So use the same study-population definition used above 
+
+populationSettings <- createStudyPopulationSettings(
+  washoutPeriod = 364,
+  firstExposureOnly = FALSE,
+  removeSubjectsWithPriorOutcome = TRUE,
+  priorOutcomeLookback = 9999,
+  riskWindowStart = 1,
+  startAnchor = "cohort start",
+  riskWindowEnd = 365,
+  endAnchor = "cohort start",
+  minTimeAtRisk = 364,
+  requireTimeAtRisk = TRUE,
+  includeAllOutcomes = TRUE
+)
+
+
+# 6. Run the LASSO prediction model
+
+lassoResults <- runPlp(
+  plpData = plpData,
+  populationSettings = populationSettings,
+  modelSettings = lassoModel,
+  splitSettings = splitSettings,
+  saveDirectory = "02_output"
+)
+```
+
